@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/zcray0326/light-cache/internal/cache/singleflight"
 )
@@ -27,9 +28,10 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 type Group struct {
 	name      string              // 命名空间,隔离不同业务的缓存
 	getter    Getter              // 未命中时的本地回源
-	mainCache cache               // 本地并发缓存(底层淘汰策略可配置)
+	mainCache *cache              // 本地并发缓存(指针:避免值拷贝分离 mu,导致后台 goroutine 和业务读写用不同锁)
 	peers     PeerPicker          // 远程节点选择器(Day5 分布式);为 nil 表示单机模式
 	loader    *singleflight.Group // Day6 防击穿:同 key 并发回源只执行一次
+	ttl       time.Duration       // 全局 TTL,0=不启用;透传给 mainCache,Add 时算 expireAt
 }
 
 var (
@@ -37,20 +39,33 @@ var (
 	groups = make(map[string]*Group)
 )
 
+// GroupOption 是 NewGroup 的函数式选项,用于可选配置(如 TTL),向后兼容。
+type GroupOption func(*Group)
+
+// WithTTL 给 Group 设置全局 TTL:缓存条目写入后 ttl 时刻过期,惰性 + 后台清理。
+// 不传此选项则无 TTL(向后兼容,行为同原先)。
+func WithTTL(ttl time.Duration) GroupOption {
+	return func(g *Group) { g.ttl = ttl }
+}
+
 // NewGroup 创建一个 Group 并注册到全局表(可按 name 查找)。
-// evictionType 决定底层淘汰策略("lru"/"fifo"/"lfu"),maxBytes 为内存上限(0=不限)。
-func NewGroup(name string, maxBytes int64, evictionType string, getter Getter) *Group {
+// evictionType 决定底层淘汰策略("lru"/"fifo"/"lfu"),maxBytes 为内存上限(0=不限),
+// getter 为未命中回源。opts 为可选配置(如 WithTTL),不传则默认无 TTL。
+func NewGroup(name string, maxBytes int64, evictionType string, getter Getter, opts ...GroupOption) *Group {
 	if getter == nil {
 		panic("nil Getter")
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
-		name:      name,
-		getter:    getter,
-		mainCache: *newCache(evictionType, maxBytes),
-		loader:    &singleflight.Group{},
+		name:   name,
+		getter: getter,
+		loader: &singleflight.Group{},
 	}
+	for _, opt := range opts {
+		opt(g)
+	}
+	g.mainCache = newCache(evictionType, maxBytes, g.ttl)
 	groups[name] = g
 	return g
 }
@@ -77,6 +92,12 @@ func (g *Group) Get(key string) (ByteView, error) {
 
 	// 2. 未命中 → load(先尝试远程节点,失败再回退本地回源)
 	return g.load(key)
+}
+
+// Stop 关闭 Group 后台清理 goroutine(若有)。生产环境 Group 是长期对象,随进程退出即可;
+// 测试用完调用防止 goroutine 泄漏。ttl=0 时无 goroutine,空操作安全。
+func (g *Group) Stop() {
+	g.mainCache.stop()
 }
 
 // RegisterPeers 注册远程节点选择器。注册后 Group 进分布式模式。

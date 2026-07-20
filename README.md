@@ -20,7 +20,7 @@
 - etcd 服务注册发现 + 动态节点 + failover
 - 多淘汰算法(LRU / LFU / FIFO / ARC,策略模式)—— LRU/FIFO/LFU ✅,ARC 待加
 - singleflight 结果缓存
-- TTL 自动清理
+- TTL 自动清理(绝对过期 + 惰性 + 后台,对齐 Redis)—— ✅
 - 缓存穿透防御(空值缓存)
 - 请求重试与退避
 - 缓存分段(细粒度锁)
@@ -45,6 +45,7 @@ go run ./cmd/server -port=8001   # 起一个缓存节点(详见 docs/DISTRIBUTED
 | [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md) | Day5 分布式节点:PeerPicker/PeerGetter、选节点、先远程后回退 |
 | [docs/SINGLEFLIGHT.md](docs/SINGLEFLIGHT.md) | Day6 防缓存击穿:singleflight 并发去重、WaitGroup 等待、去重时序特性 |
 | [docs/LFU.md](docs/LFU.md) | 扩展:LFU 淘汰策略,最小堆实现,与 LRU 哲学差异,开闭原则兑现 |
+| [docs/TTL.md](docs/TTL.md) | 扩展:TTL 过期清理,绝对过期(对齐 Redis lazy+active)、惰性+后台、方案 B 无跨层状态、WithTTL 函数式选项 |
 
 ## 参考
 

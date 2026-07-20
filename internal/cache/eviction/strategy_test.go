@@ -14,7 +14,7 @@ func (d String) Len() int {
 
 // TestLRUGet 测试 LRU 基本查找:命中返回值并前移,未命中返回 ok=false。
 func TestLRUGet(t *testing.T) {
-	c := NewLRU(int64(0), nil)
+	c := NewLRU(int64(0), 0, nil)
 	c.Add("key1", String("1234"))
 	if v, ok := c.Get("key1"); !ok || string(v.(String)) != "1234" {
 		t.Fatalf("cache hit key1=1234 failed")
@@ -29,7 +29,7 @@ func TestLRURemoveOldest(t *testing.T) {
 	k1, k2, k3 := "key1", "key2", "k3"
 	v1, v2, v3 := "value1", "value2", "v3"
 	maxBytes := len(k1 + k2 + v1 + v2)
-	c := NewLRU(int64(maxBytes), nil)
+	c := NewLRU(int64(maxBytes), 0, nil)
 	c.Add(k1, String(v1))
 	c.Add(k2, String(v2))
 	c.Add(k3, String(v3))
@@ -45,7 +45,7 @@ func TestLRUOnEvicted(t *testing.T) {
 	callback := func(key string, value Value) {
 		keys = append(keys, key)
 	}
-	c := NewLRU(int64(10), callback)
+	c := NewLRU(int64(10), 0, callback)
 	c.Add("key1", String("123456"))
 	c.Add("k2", String("k2"))
 	c.Add("k3", String("k3"))
@@ -63,7 +63,7 @@ func TestFIFORemoveOldest(t *testing.T) {
 	k1, k2, k3 := "key1", "key2", "k3"
 	v1, v2, v3 := "value1", "value2", "v3"
 	maxBytes := len(k1 + k2 + v1 + v2)
-	c := NewFIFO(int64(maxBytes), nil)
+	c := NewFIFO(int64(maxBytes), 0, nil)
 	c.Add(k1, String(v1))
 	c.Add(k2, String(v2))
 	c.Add(k3, String(v3))
@@ -75,15 +75,15 @@ func TestFIFORemoveOldest(t *testing.T) {
 
 // TestNewSelectsStrategy 测试工厂能按名字选对策略,非法名字返回 error。
 func TestNewSelectsStrategy(t *testing.T) {
-	lru, err := New("lru", int64(0), nil)
+	lru, err := New("lru", int64(0), 0, nil)
 	if err != nil || lru == nil {
 		t.Fatalf("New(lru) failed: %v", err)
 	}
-	fifo, err := New("fifo", int64(0), nil)
+	fifo, err := New("fifo", int64(0), 0, nil)
 	if err != nil || fifo == nil {
 		t.Fatalf("New(fifo) failed: %v", err)
 	}
-	if _, err := New("nope", int64(0), nil); err == nil {
+	if _, err := New("nope", int64(0), 0, nil); err == nil {
 		t.Fatalf("want error for invalid eviction name")
 	}
 }
@@ -101,7 +101,7 @@ func TestLRUvsFIFO(t *testing.T) {
 	maxBytes := int64(len(k1) + len(v1) + len(k2) + len(v2))
 
 	mk := func(name string) CacheStrategy {
-		c, err := New(name, maxBytes, nil)
+		c, err := New(name, maxBytes, 0, nil)
 		if err != nil {
 			t.Fatalf("New(%s) failed: %v", name, err)
 		}

@@ -4,7 +4,7 @@ import "testing"
 
 // TestLFUGet 测试 LFU 基本查找:命中返回值并 +1 访问次数,未命中返回 false。
 func TestLFUGet(t *testing.T) {
-	c := NewLFU(int64(0), nil)
+	c := NewLFU(int64(0), 0, nil)
 	c.Add("k1", String("v1"))
 	if v, ok := c.Get("k1"); !ok || string(v.(String)) != "v1" {
 		t.Fatalf("LFU Get k1 failed")
@@ -26,7 +26,7 @@ func TestLFUGet(t *testing.T) {
 func TestLFURemoveMin(t *testing.T) {
 	k1, k2, k3 := "k1", "k2", "k3"
 	maxBytes := int64(len(k1) + len("v1") + len(k2) + len("v2"))
-	c := NewLFU(maxBytes, nil)
+	c := NewLFU(maxBytes, 0, nil)
 	c.Add(k1, String("v1"))
 	c.Add(k2, String("v2"))
 	c.Get(k1) // k1 count=2,k2 count=1
@@ -53,7 +53,7 @@ func TestLFUvsLRU(t *testing.T) {
 	maxBytes := int64(len("k1") + len("v1") + len("k2") + len("v2"))
 
 	// --- LFU 分支 ---
-	lfu := NewLFU(maxBytes, nil)
+	lfu := NewLFU(maxBytes, 0, nil)
 	lfu.Add("k1", String("v1"))
 	lfu.Add("k2", String("v2"))
 	// 反复访问 k1,拉高它的 count
@@ -83,7 +83,7 @@ func TestLFUDiffersFromLRU(t *testing.T) {
 	maxBytes := int64(len("k1") + len("v1") + len("k2") + len("v2"))
 
 	// --- LFU:删 k2(频率低)---
-	lfu := NewLFU(maxBytes, nil)
+	lfu := NewLFU(maxBytes, 0, nil)
 	lfu.Add("k1", String("v1"))
 	// 频繁访问 k1,拉高 count
 	for i := 0; i < 5; i++ {
@@ -100,7 +100,7 @@ func TestLFUDiffersFromLRU(t *testing.T) {
 
 	// --- LRU 对照:删 k1(最久未用)---
 	// 用 LRU 跑同样操作,验证两者结果不同(对比用,不在此包外断言 LRU 内部)
-	lru := NewLRU(maxBytes, nil)
+	lru := NewLRU(maxBytes, 0, nil)
 	lru.Add("k1", String("v1"))
 	for i := 0; i < 5; i++ {
 		lru.Get("k1") // LRU:每次访问都把 k1 挪到最新
@@ -117,7 +117,7 @@ func TestLFUDiffersFromLRU(t *testing.T) {
 
 // TestLFUFactory 通过工厂按名字创建 LFU,验证策略模式接入正确。
 func TestLFUFactory(t *testing.T) {
-	c, err := New("lfu", int64(0), nil)
+	c, err := New("lfu", int64(0), 0, nil)
 	if err != nil || c == nil {
 		t.Fatalf("New(lfu) failed: %v", err)
 	}
