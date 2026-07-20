@@ -23,8 +23,7 @@ type Group struct {
 // Do 执行 fn 并返回结果。保证:同一 key 在同一时刻只有一个 fn 在跑,
 // 并发到来的重复调用会等待第一个完成,拿到相同结果。
 //
-// 这是缓存击穿防御的关键:把"未命中后的回源/远程取"包进 fn,
-// 即使 1000 个并发请求同一 key,也只回源一次,其余 999 个等结果。
+// 这是缓存击穿防御的关键:把"未命中后的回源/远程取"包进 fn, 即使 1000 个并发请求同一 key,也只回源一次,其余 999 个等结果。
 func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
 	g.mu.Lock()
 	if g.m == nil {
