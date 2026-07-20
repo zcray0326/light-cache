@@ -1,0 +1,22 @@
+# 二进制产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+light-cache
+
+# 测试与覆盖率产物
+*.test
+*.out
+coverage.txt
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# 依赖目录(如有)
+vendor/
