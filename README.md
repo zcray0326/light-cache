@@ -17,7 +17,7 @@
 ## ggcache 扩展点(7 天之后)
 
 - HTTP + gRPC 双协议
-- etcd 服务注册发现 + 动态节点 + failover
+- etcd 服务注册发现 + 动态节点 + failover(3 节点 etcd 集群,lease+watch,对齐 ggcache)—— ✅
 - 多淘汰算法(LRU / LFU / FIFO / ARC,策略模式)—— LRU/FIFO/LFU ✅,ARC 待加
 - singleflight 结果缓存
 - TTL 自动清理(绝对过期 + 惰性 + 后台,对齐 Redis)—— ✅
@@ -32,7 +32,8 @@
 
 ```bash
 go test ./...          # 跑所有测试
-go run ./cmd/server -port=8001   # 起一个缓存节点(详见 docs/DISTRIBUTED.md)
+docker-compose up -d   # 起 3 节点 etcd + 3 缓存节点 + 1 API 节点(详见 docs/ETCD.md)
+curl "http://localhost:9999/api?key=Tom"   # → 630
 ```
 
 ## 文档
@@ -48,6 +49,7 @@ go run ./cmd/server -port=8001   # 起一个缓存节点(详见 docs/DISTRIBUTED
 | [docs/LFU.md](docs/LFU.md) | 扩展:LFU 淘汰策略,最小堆实现,与 LRU 哲学差异,开闭原则兑现 |
 | [docs/TTL.md](docs/TTL.md) | 扩展:TTL 过期清理,绝对过期(对齐 Redis lazy+active)、惰性+后台、方案 B 无跨层状态、WithTTL 函数式选项 |
 | [docs/NULLCACHE.md](docs/NULLCACHE.md) | 扩展:缓存穿透防御,空值占位符(对齐 Redisson)、sentinel error、靠内容判别合法空值、防击穿+防穿透协作 |
+| [docs/ETCD.md](docs/ETCD.md) | 扩展:etcd 服务发现,3 节点 etcd 集群(Raft)、lease+watch、watch 信号触发全量重建环、和 HTTPPool.Set 衔接、docker-compose demo |
 
 ## 参考
 
