@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -70,6 +71,12 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	view, err := group.Get(key)
 	if err != nil {
+		// ErrKeyNotFound 映射成 404:让 Proxy 的 getFromPeer 能识别 not-found 并塞空值占位符防穿透。
+		// 其他 error 仍 500(DB 故障等)。
+		if errors.Is(err, ErrKeyNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -122,6 +129,10 @@ func (h *httpGetter) Get(group string, key string) ([]byte, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
+		// 404 → ErrKeyNotFound(用 %w 包裹,让 Proxy 的 errors.Is 能识别 not-found → 塞空值占位符防穿透)
+		if res.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("%w: %v", ErrKeyNotFound, res.Status)
+		}
 		return nil, fmt.Errorf("server returned: %v", res.Status)
 	}
 

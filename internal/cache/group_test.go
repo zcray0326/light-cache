@@ -163,42 +163,40 @@ func TestGet_WithTTL_LazyExpire(t *testing.T) {
 	}
 }
 
-// TestNullCache 验证缓存穿透防御(空值缓存):not-found key 首次回源后缓存占位符,
-// 后续同 key 命中占位符挡住 DB(不再回源),但仍返回 ErrKeyNotFound(保持 not-found 语义)。
+// TestNullCache 验证缓存穿透防御(空值缓存),Proxy 模式:
+// store 返回 not-found 时,Proxy 塞占位符,后续同 key 命中占位符挡住 store(不再调 store),仍返回 ErrKeyNotFound。
 func TestNullCache(t *testing.T) {
-	loadCounts := make(map[string]int)
+	// mock store:"nope" 不存在(返回 ErrKeyNotFound),"Tom" 存在(返回 630)
+	store := &mockPeerGetter{getByKey: map[string][]byte{"Tom": []byte("630")}}
 	gee := NewGroup("scores-null", 2<<10, "lru", GetterFunc(
 		func(key string) ([]byte, error) {
-			loadCounts[key]++
-			if v, ok := db[key]; ok {
-				return []byte(v), nil
-			}
-			return nil, ErrKeyNotFound // 显式 sentinel:getLocally 据此缓存占位符
-		}))
+			return nil, ErrKeyNotFound // Proxy 不回源,这个 getter 实际不被调(WithProxyMode 覆盖成 noopGetter)
+		}), WithProxyMode())
 	defer gee.Stop()
+	gee.RegisterPeers(&mockPeerPicker{getter: store})
 
-	// ① 首次 Get 不存在的 key:回源 1 次,返回 ErrKeyNotFound
+	// ① 首次 Get 不存在的 key:Proxy 转发 store,store 返回 not-found,Proxy 塞占位符
 	if _, err := gee.Get("nope"); err == nil {
 		t.Fatalf("first get nope should return ErrKeyNotFound")
 	}
-	if loadCounts["nope"] != 1 {
-		t.Fatalf("first get should load once, got %d", loadCounts["nope"])
+	if store.callCount != 1 {
+		t.Fatalf("first get should call store once, got %d", store.callCount)
 	}
 
-	// ② 第二次 Get 同 key:命中占位符,不再回源(loadCounts 不增),仍返回 ErrKeyNotFound(防穿透关键)
+	// ② 第二次 Get 同 key:命中占位符,不再调 store(防穿透关键),仍返回 ErrKeyNotFound
 	if _, err := gee.Get("nope"); err == nil {
 		t.Fatalf("second get nope should still be not-found (placeholder)")
 	}
-	if loadCounts["nope"] != 1 {
-		t.Fatalf("second get should hit placeholder, no load, got %d", loadCounts["nope"])
+	if store.callCount != 1 {
+		t.Fatalf("second get should hit placeholder, not call store, got %d", store.callCount)
 	}
 
-	// ③ 连续多次 Get,loadCounts 始终为 1(占位符持续挡住)
+	// ③ 连续多次 Get,store 调用次数始终为 1(占位符持续挡住)
 	for i := 0; i < 5; i++ {
 		gee.Get("nope")
 	}
-	if loadCounts["nope"] != 1 {
-		t.Fatalf("placeholder should block all subsequent loads, got %d", loadCounts["nope"])
+	if store.callCount != 1 {
+		t.Fatalf("placeholder should block all subsequent store calls, got %d", store.callCount)
 	}
 }
 
@@ -220,32 +218,32 @@ func TestNullCache_RealErrorNotCached(t *testing.T) {
 	}
 }
 
-// TestNullCache_TTLExpiresAndReloads 验证占位符也有 TTL:过期后重新回源(而非永久挡住)。
+// TestNullCache_TTLExpiresAndReloads 验证占位符也有 TTL:Proxy 模式下,过期后重新调 store(而非永久挡住)。
 func TestNullCache_TTLExpiresAndReloads(t *testing.T) {
-	loadCounts := make(map[string]int)
 	const ttl = 50 * time.Millisecond
+	store := &mockPeerGetter{getByKey: map[string][]byte{}} // "ghost" 不存在
 	gee := NewGroup("scores-null-ttl", 2<<10, "lru", GetterFunc(
 		func(key string) ([]byte, error) {
-			loadCounts[key]++
 			return nil, ErrKeyNotFound
-		}), WithTTL(ttl))
+		}), WithProxyMode(), WithTTL(ttl))
 	defer gee.Stop()
+	gee.RegisterPeers(&mockPeerPicker{getter: store})
 
-	gee.Get("ghost") // 首次回源,缓存占位符
-	if loadCounts["ghost"] != 1 {
-		t.Fatalf("first get should load once, got %d", loadCounts["ghost"])
+	gee.Get("ghost") // 首次调 store,返回 not-found,Proxy 塞占位符
+	if store.callCount != 1 {
+		t.Fatalf("first get should call store once, got %d", store.callCount)
 	}
 
-	gee.Get("ghost") // 命中占位符,不回源
-	if loadCounts["ghost"] != 1 {
-		t.Fatalf("placeholder hit should not load, got %d", loadCounts["ghost"])
+	gee.Get("ghost") // 命中占位符,不调 store
+	if store.callCount != 1 {
+		t.Fatalf("placeholder hit should not call store, got %d", store.callCount)
 	}
 
 	time.Sleep(ttl + 30*time.Millisecond) // 占位符过期
 
-	gee.Get("ghost") // 过期,重新回源(重新塞占位符)
-	if loadCounts["ghost"] != 2 {
-		t.Fatalf("after TTL, should reload (placeholder expired), got %d", loadCounts["ghost"])
+	gee.Get("ghost") // 过期,重新调 store(重新塞占位符)
+	if store.callCount != 2 {
+		t.Fatalf("after TTL, should call store again (placeholder expired), got %d", store.callCount)
 	}
 }
 
@@ -283,5 +281,72 @@ func TestNullCache_LegitEmptyValueNotMisjudged(t *testing.T) {
 	}
 	if loadCounts["emptykey"] != 1 {
 		t.Fatalf("second get should hit cache, no load, got %d", loadCounts["emptykey"])
+	}
+}
+
+// ---- 测试 mock:模拟 Proxy 转发到 store ----
+
+// mockPeerGetter 模拟一个远程 store 节点的 PeerGetter。
+// getByKey: key → 该 store 返回什么(值 []byte 或 ErrKeyNotFound)。store 调用计数计入 callCount。
+type mockPeerGetter struct {
+	getByKey  map[string][]byte // key → store 返回的值(若存在)
+	callCount int               // store 被调用次数(测 Proxy 防穿透:第二次应不再调 store)
+}
+
+func (m *mockPeerGetter) Get(group string, key string) ([]byte, error) {
+	m.callCount++
+	if v, ok := m.getByKey[key]; ok {
+		return v, nil
+	}
+	return nil, ErrKeyNotFound // store 确认 not-found
+}
+
+// mockPeerPicker 总是返回同一个 mockPeerGetter(单 store 拓扑,测 Proxy 逻辑用)。
+type mockPeerPicker struct {
+	getter *mockPeerGetter
+}
+
+func (p *mockPeerPicker) PickPeer(key string) (PeerGetter, bool) {
+	return p.getter, true
+}
+
+// 编译期断言:mock 实现了接口。
+var _ PeerPicker = (*mockPeerPicker)(nil)
+var _ PeerGetter = (*mockPeerGetter)(nil)
+
+// TestProxyMode_NoLocalFallback 验证 Proxy 模式:远程 store 失败直接返回 error,不本地回源。
+// Proxy 没带真实 getter(WithProxyMode 用 noopGetter),即使远程失败也不该走 getLocally。
+func TestProxyMode_NoLocalFallback(t *testing.T) {
+	store := &mockPeerGetter{getByKey: map[string][]byte{}} // 任何 key 都返回 not-found
+	gee := NewGroup("scores-proxy-nofallback", 2<<10, "lru", GetterFunc(
+		func(key string) ([]byte, error) {
+			t.Fatalf("Proxy should not call local getter (no local fallback)")
+			return nil, nil
+		}), WithProxyMode())
+	defer gee.Stop()
+	gee.RegisterPeers(&mockPeerPicker{getter: store})
+
+	// store 返回 not-found → Proxy 塞占位符 + 返回 ErrKeyNotFound(不调 local getter)
+	if _, err := gee.Get("missing"); err == nil {
+		t.Fatalf("Proxy should return error when store returns not-found")
+	}
+}
+
+// TestStoreMode_NoNullCache 验证 Store 模式:not-found 透传,不缓存空值占位符。
+// Store 纯存真实数据,防穿透在 Proxy 层。Store 的 getter 返回 ErrKeyNotFound 时不塞占位符。
+func TestStoreMode_NoNullCache(t *testing.T) {
+	loadCounts := make(map[string]int)
+	gee := NewGroup("scores-store-nocache", 2<<10, "lru", GetterFunc(
+		func(key string) ([]byte, error) {
+			loadCounts[key]++
+			return nil, ErrKeyNotFound // Store 模式默认(not-found)
+		})) // 不传 WithProxyMode → Store 模式,allowLocalFallback=true
+	defer gee.Stop()
+	// Store 无 peers(单机),load 直接走 getLocally
+
+	gee.Get("absent")
+	gee.Get("absent") // Store 不缓存占位符,第二次仍回源
+	if loadCounts["absent"] != 2 {
+		t.Fatalf("Store should not cache null placeholder, should load twice, got %d", loadCounts["absent"])
 	}
 }

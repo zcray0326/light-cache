@@ -1,23 +1,23 @@
-// 分布式缓存节点入口:启动缓存节点或前端 API 节点。
-// 节点列表不再硬编码,改由 etcd 服务发现动态获取:
-//   - 启动即注册自己到 etcd(lease+keepalive)
-//   - 启动时 ListPeers 拉一次初始化一致性哈希环
-//   - 后台 watch etcd,节点变化时重新 List + HTTPPool.Set 全量刷环
+// 分布式缓存节点入口:启动 Proxy(接入层)或 Store(存储层)节点。
+// 节点列表由 etcd 服务发现动态获取(lease+keepalive 注册 + watch 刷环):
+//   - store 模式:注册自己进环,对外 /_lightcache,带 db 回源
+//   - proxy 模式:不进环,对外 /api 转发 store,防穿透在 Proxy
 //
-// 本地运行(docker-compose 一键起 etcd 集群 + 3 缓存节点 + API 节点,见 docker-compose.yml):
+// 本地运行(docker-compose 一键起 etcd 集群 + 3 store + proxy,见 docker-compose.yml):
 //
 //	docker-compose up
 //	curl "http://localhost:9999/api?key=Tom"   → 630
 //
 // 手动单机测试(需本地起 etcd):
 //
-//	go run ./cmd/server -port=8001 -etcd=http://127.0.0.1:2379
-//	go run ./cmd/server -port=8002 -etcd=http://127.0.0.1:2379
-//	go run ./cmd/server -port=8003 -etcd=http://127.0.0.1:2379 -api
+//	go run ./cmd/server -mode=store -port=8001 -etcd=http://127.0.0.1:2379
+//	go run ./cmd/server -mode=store -port=8002 -etcd=http://127.0.0.1:2379
+//	go run ./cmd/server -mode=proxy -port=9999 -etcd=http://127.0.0.1:2379
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -36,8 +36,9 @@ var db = map[string]string{
 	"Sam":  "567",
 }
 
-// createGroup 创建名为 "scores" 的缓存组:LRU 策略,未命中从 db 回源。
-func createGroup() *cache.Group {
+// createStoreGroup 创建存储层(Store)Group:LRU 策略,未命中从 db 回源。
+// Store 带真实 getter(本地回源 DB),防穿透不在 Store 做(透传给 Proxy)。
+func createStoreGroup() *cache.Group {
 	return cache.NewGroup("scores", 2<<10, "lru", cache.GetterFunc(
 		func(key string) ([]byte, error) {
 			log.Println("[SlowDB] search key", key)
@@ -48,9 +49,21 @@ func createGroup() *cache.Group {
 		}))
 }
 
-// startCacheServer 启动一个缓存节点:从 etcd 发现 peers 建一致性哈希环,开启 HTTP 服务。
-// 节点列表全程动态:启动时 ListPeers 初始化,后台 watch 刷环。RegisterPeers 只注入一次。
-func startCacheServer(selfAddr string, cli *clientv3.Client, group *cache.Group) {
+// createProxyGroup 创建接入层(Proxy)Group:LRU 策略,WithProxyMode 配置。
+// Proxy 不带 db 不回源(allowLocalFallback=false + noopGetter 兜底),防穿透在 Proxy 层。
+func createProxyGroup() *cache.Group {
+	return cache.NewGroup("scores", 2<<10, "lru", cache.GetterFunc(
+		func(key string) ([]byte, error) {
+			// Proxy 不回源,这个 getter 实际不会被调(WithProxyMode 会用 noopGetter 覆盖)。
+			// 留着仅为 NewGroup 非 nil 约束,WithProxyMode 内部会覆盖成 noopGetter。
+			return nil, cache.ErrKeyNotFound
+		}), cache.WithProxyMode())
+}
+
+// startStoreServer 启动存储层(Store)节点:注册自己到 etcd 进环,从 etcd 发现 peers 建一致性哈希环,
+// 开启 HTTP 服务(对外 /_lightcache/<group>/<key>,供 Proxy 远程取)。节点列表全程动态。
+// Store 带真实 getter,未命中本地回源 DB;防穿透不在 Store 做(not-found 透传给 Proxy)。
+func startStoreServer(selfAddr string, cli *clientv3.Client, group *cache.Group) {
 	ctx := context.Background()
 
 	// 1. 注册自己到 etcd(lease 10s + keepalive 续约,goroutine 阻塞跑)
@@ -81,33 +94,32 @@ func startCacheServer(selfAddr string, cli *clientv3.Client, group *cache.Group)
 		}
 	}()
 
-	log.Println("light-cache node is running at", selfAddr)
+	log.Println("light-cache store node is running at", selfAddr)
 	// selfAddr 形如 "http://host:port",ListenAndServe 要去掉 "http://" 前缀(7 字符)
+	// pool 当 http.Handler,处理 /_lightcache/<group>/<key> 请求(供 Proxy 远程取)
 	log.Fatal(http.ListenAndServe(selfAddr[7:], pool))
 }
 
-// startAPIServer 启动前端 API 节点:接收外部请求,通过 Group.Get 走分布式缓存。
-// API 节点也需要注册 + watch,因为 Group.Get 未命中时按一致性哈希选远程节点,环必须最新。
-func startAPIServer(apiAddr string, cli *clientv3.Client, group *cache.Group) {
-	// API 节点也注册自己(可选,但保持拓扑一致):它在环里也能被路由
-	go func() {
-		if err := discovery.Register(context.Background(), cli, apiAddr, 10*time.Second); err != nil {
-			log.Printf("[discovery] api register failed: %v", err)
-		}
-	}()
+// startProxyServer 启动接入层(Proxy)节点:接收外部 /api 请求,通过 Group.Get 走分布式缓存。
+// Proxy **不注册 etcd**(不背数据分片,不进环),只 List+Watch 拿 store 列表建环用于 PickPeer 转发。
+// Proxy 不回源(WithProxyMode),远程 store 失败返回 error;防穿透在 Proxy(远程 not-found 时塞占位符)。
+func startProxyServer(apiAddr string, cli *clientv3.Client, group *cache.Group) {
+	ctx := context.Background()
 
-	// API 节点也建环 + watch,保证 PickPeer 选对远程节点
-	peers, _ := discovery.ListPeers(context.Background(), cli)
+	// Proxy 不调 Register:不进环,不被一致性哈希路由(它不背数据)。
+	// 只 List+Watch 拿 store 列表建环,供 Group.Get → PickPeer 选 store 转发。
+	peers, _ := discovery.ListPeers(ctx, cli)
 	pool := cache.NewHTTPPool(apiAddr)
 	pool.Set(peers...)
 	group.RegisterPeers(pool)
 
 	update := make(chan struct{}, 1)
-	go discovery.WatchPeers(context.Background(), cli, update)
+	go discovery.WatchPeers(ctx, cli, update)
 	go func() {
 		for range update {
-			if peers, err := discovery.ListPeers(context.Background(), cli); err == nil {
+			if peers, err := discovery.ListPeers(ctx, cli); err == nil {
 				pool.Set(peers...)
+				log.Printf("[discovery] peers refreshed: %v", peers)
 			}
 		}
 	}()
@@ -117,6 +129,11 @@ func startAPIServer(apiAddr string, cli *clientv3.Client, group *cache.Group) {
 			key := r.URL.Query().Get("key")
 			view, err := group.Get(key)
 			if err != nil {
+				// ErrKeyNotFound 返回 404(命中空值占位符或 store 确认 not-found),其他 error 返回 500
+				if errors.Is(err, cache.ErrKeyNotFound) {
+					http.Error(w, err.Error(), http.StatusNotFound)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -129,11 +146,11 @@ func startAPIServer(apiAddr string, cli *clientv3.Client, group *cache.Group) {
 
 func main() {
 	var port int
-	var api bool
+	var mode string
 	var host string
 	var etcdEndpoints string
 	flag.IntVar(&port, "port", 8001, "light-cache server port")
-	flag.BoolVar(&api, "api", false, "start a frontend api server?")
+	flag.StringVar(&mode, "mode", "store", "node mode: proxy (接入层,转发+防穿透) or store (存储层,回源+存数据)")
 	flag.StringVar(&host, "host", "localhost", "advertise host for this node (docker 里用容器名,保证其他节点能回连)")
 	flag.StringVar(&etcdEndpoints, "etcd", "http://127.0.0.1:2379", "etcd endpoints, comma-separated (3 节点集群可填多个)")
 	flag.Parse()
@@ -151,12 +168,14 @@ func main() {
 	}
 	defer cli.Close()
 
-	group := createGroup()
-	if api {
-		// API 节点:只起前端 API server(转发到缓存节点),不起 cache server。
-		// 避免和缓存节点分开部署时重复 RegisterPeers panic。
-		startAPIServer("http://"+host+":9999", cli, group)
+	if mode == "proxy" {
+		// Proxy(接入层):不回源、不注册 etcd。对外 /api 转发到 store,防穿透在 Proxy。
+		// Group 配 Proxy 模式(allowLocalFallback=false + noopGetter 兜底)。
+		group := createProxyGroup()
+		startProxyServer("http://"+host+":9999", cli, group)
 		return
 	}
-	startCacheServer(selfAddr, cli, group)
+	// Store(存储层):注册 etcd 进环,对外 /_lightcache,带 db 回源。
+	group := createStoreGroup()
+	startStoreServer(selfAddr, cli, group)
 }

@@ -37,13 +37,19 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 
 // Group 是一个缓存命名空间,持有并发缓存和未命中回源逻辑。
 // 外部只与 Group 打交道:命中直接返回,未命中先尝试远程节点(若有),再回退本地回源。
+//
+// 角色分离(Proxy/Store):
+//   - Store(存储层):allowLocalFallback=true,远程失败回退本地回源(带 db)
+//   - Proxy(接入层):allowLocalFallback=false,远程失败直接返回 error(不带 db,不回源);
+//     且防穿透(空值缓存)只在 Proxy 层做——远程返回 ErrKeyNotFound 时塞占位符
 type Group struct {
-	name      string              // 命名空间,隔离不同业务的缓存
-	getter    Getter              // 未命中时的本地回源
-	mainCache *cache              // 本地并发缓存(指针:避免值拷贝分离 mu,导致后台 goroutine 和业务读写用不同锁)
-	peers     PeerPicker          // 远程节点选择器(Day5 分布式);为 nil 表示单机模式
-	loader    *singleflight.Group // Day6 防击穿:同 key 并发回源只执行一次
-	ttl       time.Duration       // 全局 TTL,0=不启用;透传给 mainCache,Add 时算 expireAt
+	name               string              // 命名空间,隔离不同业务的缓存
+	getter             Getter              // 未命中时的本地回源(Proxy 模式用 noopGetter 兜底,实际不调)
+	mainCache          *cache              // 本地并发缓存(指针:避免值拷贝分离 mu,导致后台 goroutine 和业务读写用不同锁)
+	peers              PeerPicker          // 远程节点选择器(Day5 分布式);为 nil 表示单机模式
+	loader             *singleflight.Group // Day6 防击穿:同 key 并发回源只执行一次
+	ttl                time.Duration       // 全局 TTL,0=不启用;透传给 mainCache,Add 时算 expireAt
+	allowLocalFallback bool                // 远程失败是否回退本地回源:Store=true,Proxy=false
 }
 
 var (
@@ -59,6 +65,26 @@ type GroupOption func(*Group)
 func WithTTL(ttl time.Duration) GroupOption {
 	return func(g *Group) { g.ttl = ttl }
 }
+
+// WithProxyMode 把 Group 配置为接入层(Proxy)模式:
+//   - allowLocalFallback=false:远程 store 失败直接返回 error,不本地回源(Proxy 不带 db)
+//   - getter 用 noopGetter 兜底(NewGroup 要求非 nil),实际不会被调用(不回源)
+//   - 防穿透(空值缓存)在 Proxy 层:远程 store 返回 ErrKeyNotFound 时塞占位符
+//
+// 不传此选项默认 Store 模式(allowLocalFallback=true,远程失败回退本地回源)。
+func WithProxyMode() GroupOption {
+	return func(g *Group) {
+		g.allowLocalFallback = false
+		g.getter = noopGetter{}
+	}
+}
+
+// noopGetter 是 Proxy 模式的兜底回源:永远返回 ErrKeyNotFound。
+// Proxy 不本地回源(allowLocalFallback=false,load 不走 getLocally),实际不会被调用;
+// 存在仅为满足 NewGroup 的"非 nil getter"约束。
+type noopGetter struct{}
+
+func (noopGetter) Get(key string) ([]byte, error) { return nil, ErrKeyNotFound }
 
 // NewGroup 创建一个 Group 并注册到全局表(可按 name 查找)。
 // evictionType 决定底层淘汰策略("lru"/"fifo"/"lfu"),maxBytes 为内存上限(0=不限),
@@ -126,7 +152,9 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 }
 
 // load 处理未命中:用 singleflight 保证同一 key 的并发回源(本地或远程)只执行一次,
-// 防缓存击穿。fn 内先尝试远程节点(若有),失败回退本地回源。
+// 防缓存击穿。fn 内先尝试远程节点(若有),按角色分流失败处理:
+//   - Store:远程失败回退本地回源(带 db)
+//   - Proxy:远程失败直接返回 error(不回源);且远程返回 ErrKeyNotFound 时塞空值占位符(防穿透在 Proxy 层)
 func (g *Group) load(key string) (value ByteView, err error) {
 	viewi, err := g.loader.Do(key, func() (interface{}, error) {
 		if g.peers != nil {
@@ -134,10 +162,18 @@ func (g *Group) load(key string) (value ByteView, err error) {
 				if value, err = g.getFromPeer(peer, key); err == nil {
 					return value, nil
 				}
+				// 远程失败
 				log.Println("[light-cache] Failed to get from peer", err)
+				if !g.allowLocalFallback {
+					// Proxy 模式:不回源。若远程确认 not-found,塞空值占位符防穿透(只 Proxy 层做)
+					if errors.Is(err, ErrKeyNotFound) {
+						g.populateCache(key, ByteView{b: []byte(nullPlaceholder)})
+					}
+					return ByteView{}, err
+				}
+				// Store 模式:回退本地回源
 			}
 		}
-		// 远程不可用或单机模式 → 本地回源
 		return g.getLocally(key)
 	})
 	if err == nil {
@@ -149,6 +185,7 @@ func (g *Group) load(key string) (value ByteView, err error) {
 
 // getFromPeer 从远程节点取数据。
 // 注意:远程取回的值不写回本地缓存(原版 GeeCache 设计),避免节点间数据冗余扩散。
+// Proxy 模式下,空值占位符的写入在 load 里(基于远程返回的 ErrKeyNotFound 信号),不走 getFromPeer。
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	bytes, err := peer.Get(g.name, key)
 	if err != nil {
@@ -157,17 +194,12 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	return ByteView{b: bytes}, nil
 }
 
-// getLocally 从回源 getter 取数据,包成 ByteView 写回缓存。
-// 若 getter 确认 key 不存在(返回 ErrKeyNotFound):缓存一个空值占位符短时挡住后续相同 key 的请求,
-// 防缓存穿透;但仍返回 ErrKeyNotFound(对外保持 not-found 语义)。
-// 真错误(DB 故障等)不缓存占位符,直接透传 error。
+// getLocally 从回源 getter 取数据,包成 ByteView 写回缓存(Store 模式用)。
+// Store 模式不做防穿透(空值缓存在 Proxy 层):not-found 直接返回 ErrKeyNotFound 透传给 Proxy,
+// 由 Proxy 决定缓存空值。Store 纯存真实数据。
 func (g *Group) getLocally(key string) (ByteView, error) {
 	bytes, err := g.getter.Get(key)
 	if err != nil {
-		if errors.Is(err, ErrKeyNotFound) {
-			// not-found:缓存占位符,短时挡住后续相同 key 的请求,防穿透
-			g.populateCache(key, ByteView{b: []byte(nullPlaceholder)})
-		}
 		return ByteView{}, err
 	}
 	// 回源拿到的 []byte 必须拷贝:调用方可能继续持有/修改这个 slice,不拷贝会污染缓存。

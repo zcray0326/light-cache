@@ -18,6 +18,7 @@
 
 - HTTP + gRPC 双协议
 - etcd 服务注册发现 + 动态节点 + failover(3 节点 etcd 集群,lease+watch,对齐 ggcache)—— ✅
+- Proxy/Store 角色分离(接入层收敛防护,存储层纯存数据,对齐生产级架构)—— ✅
 - 多淘汰算法(LRU / LFU / FIFO / ARC,策略模式)—— LRU/FIFO/LFU ✅,ARC 待加
 - singleflight 结果缓存
 - TTL 自动清理(绝对过期 + 惰性 + 后台,对齐 Redis)—— ✅
@@ -50,6 +51,7 @@ curl "http://localhost:9999/api?key=Tom"   # → 630
 | [docs/TTL.md](docs/TTL.md) | 扩展:TTL 过期清理,绝对过期(对齐 Redis lazy+active)、惰性+后台、方案 B 无跨层状态、WithTTL 函数式选项 |
 | [docs/NULLCACHE.md](docs/NULLCACHE.md) | 扩展:缓存穿透防御,空值占位符(对齐 Redisson)、sentinel error、靠内容判别合法空值、防击穿+防穿透协作 |
 | [docs/ETCD.md](docs/ETCD.md) | 扩展:etcd 服务发现,3 节点 etcd 集群(Raft)、lease+watch、watch 信号触发全量重建环、和 HTTPPool.Set 衔接、docker-compose demo |
+| [docs/PROXY.md](docs/PROXY.md) | 扩展:Proxy/Store 角色分离,防护收敛接入层、存储层纯存数据、对等架构硬伤对比、allowLocalFallback、空值缓存归属 |
 
 ## 参考
 
