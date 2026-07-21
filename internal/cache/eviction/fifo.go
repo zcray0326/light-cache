@@ -5,20 +5,17 @@ import (
 	"time"
 )
 
-// fifoCache 先进先出。和 LRU 的唯一区别:Get 命中时不移动节点。
-// 非并发安全 —— 所有方法(含 CleanUp)都假设单线程,由上层 cache 层用 Mutex 保护。
-// TTL 同 LRU:ttl>0 时 Add 算 expireAt、Get 惰性检查;CleanUp 遍历删过期。并发保护和后台 goroutine 在上层。
+// fifoCache 是 FIFO 实现(非并发安全,上层 cache 加锁)。和 LRU 唯一区别:Get 命中不移动节点。
 type fifoCache struct {
-	maxBytes  int64                         // maxBytes 为允许使用的最大内存,0 表示不限制。
-	nbytes    int64                         // nbytes 为当前已使用的内存。
-	ll        *list.List                    // ll 为双向链表。
-	cache     map[string]*list.Element      // cache 为 key 到链表节点的映射,用于 O(1) 查找。
-	OnEvicted func(key string, value Value) // OnEvicted 是可选回调,在记录被淘汰时执行。
-	ttl       time.Duration                 // ttl 为全局过期时长,0=不启用 TTL。
+	maxBytes  int64
+	nbytes    int64
+	ll        *list.List
+	cache     map[string]*list.Element      // key → 链表节点
+	OnEvicted func(key string, value Value) // 淘汰回调(可 nil)
+	ttl       time.Duration                 // 0=不启用 TTL
 }
 
-// NewFIFO 构造 FIFO 缓存。maxBytes 为上限(0=不限),ttl 为过期时长(0=不启用 TTL),
-// onEvicted 为淘汰回调(可 nil)。并发保护和后台清理 goroutine 由上层 cache 负责。
+// NewFIFO 构造 FIFO 缓存。并发保护和后台清理由上层 cache 负责。
 func NewFIFO(maxBytes int64, ttl time.Duration, onEvicted func(string, Value)) *fifoCache {
 	return &fifoCache{
 		maxBytes:  maxBytes,
@@ -29,7 +26,7 @@ func NewFIFO(maxBytes int64, ttl time.Duration, onEvicted func(string, Value)) *
 	}
 }
 
-// Get 命中时先惰性检查过期:过期删掉返回未命中;未过期返回值。不动链表顺序(FIFO 特性)。
+// Get 命中先惰性判过期(过期删+未命中),未过期返回值(不动链表顺序,FIFO 特性)。
 func (c *fifoCache) Get(key string) (Value, bool) {
 	if ele, hit := c.cache[key]; hit {
 		kv := ele.Value.(*entry)
@@ -42,16 +39,16 @@ func (c *fifoCache) Get(key string) (Value, bool) {
 	return nil, false
 }
 
-// Add 新增到队尾(PushBack),超限淘汰队首(Front)。ttl>0 时算 expireAt 写入。
+// Add 新增到队尾。已存在只更新值不移动(FIFO 不因更新插队)。超限淘汰队首。
 func (c *fifoCache) Add(key string, value Value) {
 	if ele, ok := c.cache[key]; ok {
 		kv := ele.Value.(*entry)
 		c.nbytes += int64(value.Len()) - int64(kv.value.Len())
-		kv.value = value // 已存在只更新值,位置不动(FIFO 不因更新而插队)
+		kv.value = value
 		kv.expireAt = c.deadline()
 	} else {
 		ele := c.ll.PushBack(&entry{key: key, value: value, expireAt: c.deadline()})
-		c.cache[key] = ele //cache map新增一对映射
+		c.cache[key] = ele
 		c.nbytes += int64(len(key)) + int64(value.Len())
 	}
 	for c.maxBytes != 0 && c.maxBytes < c.nbytes {
@@ -59,7 +56,7 @@ func (c *fifoCache) Add(key string, value Value) {
 	}
 }
 
-// deadline 返回该 entry 的绝对过期时刻。ttl=0 返回零值(永不过期)。
+// deadline 返回绝对过期时刻。ttl=0 返回零值。
 func (c *fifoCache) deadline() time.Time {
 	if c.ttl <= 0 {
 		return time.Time{}
@@ -67,7 +64,7 @@ func (c *fifoCache) deadline() time.Time {
 	return time.Now().Add(c.ttl)
 }
 
-// removeOldest FIFO 淘汰队首(最早进入的)
+// removeOldest 淘汰队首(最早进入)。
 func (c *fifoCache) removeOldest() {
 	ele := c.ll.Front()
 	if ele != nil {
@@ -75,7 +72,7 @@ func (c *fifoCache) removeOldest() {
 	}
 }
 
-// removeElement 删掉指定节点:链表移除、map 删映射、扣内存、回调。复用给 removeOldest/Get/CleanUp。
+// removeElement 删指定节点(链表移除+map 删+扣内存+回调)。
 func (c *fifoCache) removeElement(ele *list.Element) {
 	c.ll.Remove(ele)
 	kv := ele.Value.(*entry)
@@ -86,7 +83,7 @@ func (c *fifoCache) removeElement(ele *list.Element) {
 	}
 }
 
-// CleanUp 遍历链表,删掉所有过期 entry。无参 —— entry 自带 expireAt 能自判。非并发安全,由上层持锁调用。
+// CleanUp 遍历删所有过期 entry。
 func (c *fifoCache) CleanUp() {
 	var next *list.Element
 	for ele := c.ll.Front(); ele != nil; ele = next {

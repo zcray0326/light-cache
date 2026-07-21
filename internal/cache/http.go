@@ -18,21 +18,16 @@ const (
 	defaultReplicas = 50 // 一致性哈希虚拟节点数,越大分布越均匀
 )
 
-// HTTPPool 既是 HTTP 服务端(响应其他节点请求),也是客户端(向其他节点取数据)。
-// 服务端:实现 http.Handler,处理 /_lightcache/<group>/<key> 请求。
-// 客户端:实现 PeerPicker(Set 注册节点 + PickPeer 选节点),httpGetter 实现 PeerGetter。
+// HTTPPool 既是 HTTP 服务端(处理 /_lightcache/<group>/<key>),也是客户端(PickPeer 选节点 + httpGetter 取数据)。
 type HTTPPool struct {
-	// self 是本节点对外地址,如 "localhost:9999"
-	self string
-	// basePath 是统一前缀,默认 /_lightcache/
-	basePath string
-	mu       sync.Mutex // 保护 peers 和 httpGetters 的并发读写
-	peers    *consistenthash.Map
-	// httpGetters 按节点地址缓存对应的 HTTP 客户端,如 "http://localhost:8001" → *httpGetter
-	httpGetters map[string]*httpGetter
+	self        string     // 本节点对外地址
+	basePath    string     // 统一前缀,默认 /_lightcache/
+	mu          sync.Mutex // 保护 peers 和 httpGetters
+	peers       *consistenthash.Map
+	httpGetters map[string]*httpGetter // 节点地址 → HTTP 客户端
 }
 
-// NewHTTPPool 创建一个 HTTPPool,self 为本节点地址。
+// NewHTTPPool 创建 HTTPPool,self 为本节点地址。
 func NewHTTPPool(self string) *HTTPPool {
 	return &HTTPPool{
 		self:     self,
@@ -45,9 +40,7 @@ func (p *HTTPPool) Log(format string, v ...interface{}) {
 	log.Printf("[Server %s] %s", p.self, fmt.Sprintf(format, v...))
 }
 
-// ServeHTTP 处理所有 HTTP 请求,实现 http.Handler 接口(服务端职责)。
-//
-// 约定 URL 格式:/<basePath>/<groupname>/<key>
+// ServeHTTP 处理 /<basePath>/<group>/<key> 请求(服务端职责)。
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(r.URL.Path, p.basePath) {
 		panic("HTTPPool serving unexpected path: " + r.URL.Path)
@@ -71,8 +64,7 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	view, err := group.Get(key)
 	if err != nil {
-		// ErrKeyNotFound 映射成 404:让 Proxy 的 getFromPeer 能识别 not-found 并塞空值占位符防穿透。
-		// 其他 error 仍 500(DB 故障等)。
+		// ErrKeyNotFound → 404(让 Proxy 识别 not-found 塞占位符防穿透),其他 error → 500
 		if errors.Is(err, ErrKeyNotFound) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
@@ -85,8 +77,7 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Write(view.ByteSlice())
 }
 
-// Set 更新节点列表,重建一致性哈希环并为每个节点建一个 httpGetter(客户端职责)。
-// 每次调用都重新建环,便于后续支持动态增减节点。
+// Set 全量重建一致性哈希环 + 为每个节点建 httpGetter(客户端职责)。
 func (p *HTTPPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -98,8 +89,7 @@ func (p *HTTPPool) Set(peers ...string) {
 	}
 }
 
-// PickPeer 按 key 用一致性哈希选一个远程节点(排除自己),返回其 httpGetter。
-// 实现 PeerPicker 接口(客户端职责)。
+// PickPeer 一致性哈希选远程节点(排除自己),返回其 httpGetter。
 func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -110,16 +100,14 @@ func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 	return nil, false
 }
 
-// 编译期断言:*HTTPPool 实现了 PeerPicker 接口。
 var _ PeerPicker = (*HTTPPool)(nil)
 
-// httpGetter 是向单个远程节点取数据的 HTTP 客户端,实现 PeerGetter。
+// httpGetter 是向单个远程节点取数据的 HTTP 客户端。
 type httpGetter struct {
 	baseURL string // 如 "http://localhost:8001/_lightcache/"
 }
 
-// Get 向 baseURL 拼出 /<group>/<key> 的请求 URL,HTTP GET 取回字节。
-// group/key 用 url.QueryEscape 转义,避免含特殊字符破坏 URL。
+// Get 向 baseURL 拼 /<group>/<key>(转义)HTTP GET 取回字节。404 包成 ErrKeyNotFound 供 Proxy 识别。
 func (h *httpGetter) Get(group string, key string) ([]byte, error) {
 	u := fmt.Sprintf("%v%v/%v", h.baseURL, url.QueryEscape(group), url.QueryEscape(key))
 	res, err := http.Get(u)
@@ -129,8 +117,7 @@ func (h *httpGetter) Get(group string, key string) ([]byte, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		// 404 → ErrKeyNotFound(用 %w 包裹,让 Proxy 的 errors.Is 能识别 not-found → 塞空值占位符防穿透)
-		if res.StatusCode == http.StatusNotFound {
+		if res.StatusCode == http.StatusNotFound { // %w 包 ErrKeyNotFound,Proxy 据此塞占位符
 			return nil, fmt.Errorf("%w: %v", ErrKeyNotFound, res.Status)
 		}
 		return nil, fmt.Errorf("server returned: %v", res.Status)
@@ -143,5 +130,4 @@ func (h *httpGetter) Get(group string, key string) ([]byte, error) {
 	return bytes, nil
 }
 
-// 编译期断言:*httpGetter 实现了 PeerGetter 接口。
 var _ PeerGetter = (*httpGetter)(nil)
