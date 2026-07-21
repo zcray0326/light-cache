@@ -1,8 +1,12 @@
-// 分布式缓存节点入口:启动 Proxy(接入层)或 Store(存储层)。
-// Group 名单从 config.yml 读启动时批量建(幂等);节点列表由 etcd 服务发现动态获取。
-// store:注册进环,对外 /_lightcache,带 db 回源。proxy:不进环,对外 /api 转发 store,防穿透在 Proxy。
+// light-cache 示例:演示怎么用这个内嵌分布式缓存库(对等节点)。
 //
-// 运行:docker-compose up;curl "http://localhost:9999/api?key=Tom" → 630
+// 每个节点对等:都注册自己到 etcd(进环)、都对外提供 /api + /_lightcache、都带 db 回源。
+// 节点列表由 etcd 服务发现动态获取(lease+keepalive 注册 + watch 刷环)。
+//
+// 运行(docker-compose 一键起 etcd 集群 + 多节点,见 docker-compose.yml):
+//
+//	docker-compose up
+//	curl "http://localhost:8001/api?key=Tom"   → 630
 package main
 
 import (
@@ -12,10 +16,10 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	cache "github.com/zcray0326/light-cache/internal/cache"
-	"github.com/zcray0326/light-cache/internal/config"
 	"github.com/zcray0326/light-cache/internal/discovery"
 	"go.etcd.io/etcd/client/v3"
 )
@@ -26,56 +30,40 @@ var db = map[string]string{
 	"Sam":  "567",
 }
 
-// sharedGetter 是所有 Group 共用的回源 getter(查同一 db,not-found 返回 ErrKeyNotFound)。后续要按 group 路由数据源再改。
-var sharedGetter = cache.GetterFunc(func(key string) ([]byte, error) {
-	log.Println("[SlowDB] search key", key)
-	if v, ok := db[key]; ok {
-		return []byte(v), nil
-	}
-	return nil, cache.ErrKeyNotFound
-})
-
-// buildGroups 按 config 批量建 Group(幂等)。store 用 sharedGetter 回源,proxy 用 WithProxyMode 不回源。
-func buildGroups(role string) map[string]*cache.Group {
-	gm := make(map[string]*cache.Group)
-	for _, c := range config.Conf.Groups {
-		opts := []cache.GroupOption{}
-		if ttl := c.TTLDuration(); ttl > 0 {
-			opts = append(opts, cache.WithTTL(ttl))
-		}
-		var g *cache.Group
-		if role == "proxy" {
-			opts = append(opts, cache.WithProxyMode())
-			g = cache.NewGroup(c.Name, c.MaxBytes, c.EvictionType,
-				cache.GetterFunc(func(string) ([]byte, error) { return nil, cache.ErrKeyNotFound }),
-				opts...)
-		} else {
-			g = cache.NewGroup(c.Name, c.MaxBytes, c.EvictionType, sharedGetter, opts...)
-		}
-		gm[c.Name] = g
-	}
-	return gm
+// createGroup 创建 "scores" Group:LRU 策略,未命中从 db 回源(not-found 返回 ErrKeyNotFound,空值缓存防穿透)。
+func createGroup() *cache.Group {
+	return cache.NewGroup("scores", 2<<10, "lru", cache.GetterFunc(
+		func(key string) ([]byte, error) {
+			log.Println("[SlowDB] search key", key)
+			if v, ok := db[key]; ok {
+				return []byte(v), nil
+			}
+			return nil, cache.ErrKeyNotFound
+		}))
 }
 
-// startStoreServer 启动 Store:注册 etcd 进环,对每个 Group RegisterPeers,起 HTTP 服务处理 /_lightcache。
-func startStoreServer(selfAddr string, cli *clientv3.Client, gm map[string]*cache.Group) {
+// startServer 启动对等节点:注册 etcd 进环,建一致性哈希环 + RegisterPeers,
+// 对外 /api(用户入口)+ /_lightcache(供其他节点远程取)。未命中本地回源 + 空值缓存防穿透。
+func startServer(selfAddr string, cli *clientv3.Client, group *cache.Group) {
 	ctx := context.Background()
+
+	// 1. 注册自己到 etcd(进环,被一致性哈希路由)
 	go func() {
 		if err := discovery.Register(ctx, cli, selfAddr, 10*time.Second); err != nil {
 			log.Printf("[discovery] register failed: %v", err)
 		}
 	}()
 
+	// 2. 拉一次节点列表 → 建环 + 注入 Group
 	peers, err := discovery.ListPeers(ctx, cli)
 	if err != nil {
 		log.Printf("[discovery] list peers failed: %v", err)
 	}
 	pool := cache.NewHTTPPool(selfAddr)
 	pool.Set(peers...)
-	for _, g := range gm {
-		g.RegisterPeers(pool)
-	}
+	group.RegisterPeers(pool)
 
+	// 3. watch 刷环
 	update := make(chan struct{}, 1)
 	go discovery.WatchPeers(ctx, cli, update)
 	go func() {
@@ -87,44 +75,10 @@ func startStoreServer(selfAddr string, cli *clientv3.Client, gm map[string]*cach
 		}
 	}()
 
-	log.Println("light-cache store node is running at", selfAddr)
-	log.Fatal(http.ListenAndServe(selfAddr[7:], pool))
-}
-
-// startProxyServer 启动 Proxy:不注册 etcd,建环 + 每个 Group RegisterPeers,对外 /api?key=&group= 转发。
-func startProxyServer(apiAddr string, cli *clientv3.Client, gm map[string]*cache.Group) {
-	ctx := context.Background()
-
-	peers, _ := discovery.ListPeers(ctx, cli)
-	pool := cache.NewHTTPPool(apiAddr)
-	pool.Set(peers...)
-	for _, g := range gm {
-		g.RegisterPeers(pool)
-	}
-
-	update := make(chan struct{}, 1)
-	go discovery.WatchPeers(ctx, cli, update)
-	go func() {
-		for range update {
-			if peers, err := discovery.ListPeers(ctx, cli); err == nil {
-				pool.Set(peers...)
-				log.Printf("[discovery] peers refreshed: %v", peers)
-			}
-		}
-	}()
-
+	// 4. /api 对外入口:用户打这里,Group.Get 未命中按一致性哈希选远程节点取(排除自己)
 	http.Handle("/api", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			key := r.URL.Query().Get("key")
-			groupName := r.URL.Query().Get("group")
-			if groupName == "" {
-				groupName = "scores"
-			}
-			group := cache.GetGroup(groupName)
-			if group == nil {
-				http.Error(w, "no such group: "+groupName, http.StatusNotFound)
-				return
-			}
 			view, err := group.Get(key)
 			if err != nil {
 				if errors.Is(err, cache.ErrKeyNotFound) {
@@ -137,26 +91,25 @@ func startProxyServer(apiAddr string, cli *clientv3.Client, gm map[string]*cache
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Write(view.ByteSlice())
 		}))
-	log.Println("frontend api server is running at", apiAddr)
-	log.Fatal(http.ListenAndServe(apiAddr[7:], nil))
+
+	log.Println("light-cache node is running at", selfAddr)
+	// pool 当 handler 处理 /_lightcache/<group>/<key>(供其他节点远程取);/api 走默认 mux
+	http.Handle("/_lightcache/", pool)
+	log.Fatal(http.ListenAndServe(selfAddr[7:], nil))
 }
 
 func main() {
 	var port int
-	var mode, host, configPath string
-	flag.IntVar(&port, "port", 8001, "light-cache server port")
-	flag.StringVar(&mode, "mode", "store", "node mode: proxy (接入层) or store (存储层)")
+	var host, etcdEndpoints string
+	flag.IntVar(&port, "port", 8001, "light-cache node port")
 	flag.StringVar(&host, "host", "localhost", "advertise host (docker 里用容器名)")
-	flag.StringVar(&configPath, "config", "config.yml", "config file path")
+	flag.StringVar(&etcdEndpoints, "etcd", "http://127.0.0.1:2379", "etcd endpoints, comma-separated")
 	flag.Parse()
 
-	if err := config.Init(configPath); err != nil {
-		log.Fatalf("load config %s failed: %v", configPath, err)
-	}
-
 	selfAddr := "http://" + host + ":" + strconv.Itoa(port)
+
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   config.Conf.Etcd.Endpoints,
+		Endpoints:   strings.Split(etcdEndpoints, ","),
 		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
@@ -164,9 +117,5 @@ func main() {
 	}
 	defer cli.Close()
 
-	if mode == "proxy" {
-		startProxyServer("http://"+host+":9999", cli, buildGroups("proxy"))
-		return
-	}
-	startStoreServer(selfAddr, cli, buildGroups("store"))
+	startServer(selfAddr, cli, createGroup())
 }

@@ -70,7 +70,7 @@ demo 和生产同款配置(不区分),注册中心本身高可用。
 
 ```bash
 docker-compose up -d
-# 起 3 节点 etcd 集群 + 3 缓存节点 + 1 API 节点
+# 起 3 节点 etcd 集群 + 3 个对等缓存节点(node1:8001 node2:8002 api:9999)
 ```
 
 ### 验证服务发现
@@ -86,7 +86,7 @@ docker exec light-cache-etcd0-1 etcdctl --endpoints=http://localhost:2379 get --
 ### 验证分布式路由
 
 ```bash
-curl "http://localhost:9999/api?key=Tom"   # → 630(API 转发到一致性哈希选出的缓存节点)
+curl "http://localhost:9999/api?key=Tom"   # → 630(对等节点,未命中按一致性哈希选远程节点取)
 curl "http://localhost:9999/api?key=Jack"  # → 589
 ```
 
@@ -119,6 +119,6 @@ docker logs light-cache-node2-1 | tail     # node1 重新进环
 
 - `internal/discovery/etcd.go` — Register(lease+keepalive)、ListPeers、WatchPeers
 - `cmd/server/main.go` — 接 etcd:client 初始化、Register、ListPeers 初始化环、WatchPeers goroutine 刷环、`-etcd`/`-host` flag
-- `docker-compose.yml` — 3 节点 etcd 集群 + 3 缓存节点 + 1 API 节点
+- `docker-compose.yml` — 3 节点 etcd 集群 + 3 个对等缓存节点
 - `Dockerfile` — 多阶段构建(builder 编译 + alpine 运行镜像)
 - 不改:`internal/cache/http.go`(HTTPPool.Set 已是全量替换)、`group.go`(RegisterPeers 注入一次)、`consistenthash/`(全量重建)

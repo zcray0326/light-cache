@@ -57,16 +57,14 @@ services:
     ports:
       - "32379:2379"
 
-  # ---- light-cache 缓存节点(3 个)----
+  # ---- light-cache 对等节点(3 个)----
+  # 每个节点对等:都注册 etcd 进环、都对外 /api + /_lightcache、都带 db 回源。
   # host 用容器名,保证其他节点能按 http://node1:8001 回连(PickPeer 排除自己靠地址一致)
-  # 依赖 etcd 集群起来后启动(depends_on + healthcheck 等 etcd 就绪)
   node1:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["-mode=store", "-port=8001", "-host=node1"]
-    volumes:
-      - ./config.yml:/app/config.yml:ro
+    command: ["-port=8001", "-host=node1", "-etcd=http://etcd0:2379,http://etcd1:2379,http://etcd2:2379"]
     ports:
       - "8001:8001"
     depends_on:
@@ -81,9 +79,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["-mode=store", "-port=8002", "-host=node2"]
-    volumes:
-      - ./config.yml:/app/config.yml:ro
+    command: ["-port=8002", "-host=node2", "-etcd=http://etcd0:2379,http://etcd1:2379,http://etcd2:2379"]
     ports:
       - "8002:8002"
     depends_on:
@@ -94,15 +90,13 @@ services:
       etcd2:
         condition: service_started
 
-  node3:
+  api:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["-mode=store", "-port=8003", "-host=node3"]
-    volumes:
-      - ./config.yml:/app/config.yml:ro
+    command: ["-port=9999", "-host=api", "-etcd=http://etcd0:2379,http://etcd1:2379,http://etcd2:2379"]
     ports:
-      - "8003:8003"
+      - "9999:9999"
     depends_on:
       etcd0:
         condition: service_started
@@ -110,18 +104,3 @@ services:
         condition: service_started
       etcd2:
         condition: service_started
-
-  # ---- 前端 API 节点(对外 9999,转发到一致性哈希选出的缓存节点)----
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: ["-mode=proxy", "-port=9999", "-host=api"]
-    volumes:
-      - ./config.yml:/app/config.yml:ro
-    ports:
-      - "9999:9999"
-    depends_on:
-      - node1
-      - node2
-      - node3
