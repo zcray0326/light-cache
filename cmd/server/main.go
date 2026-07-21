@@ -14,7 +14,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 
@@ -35,7 +34,7 @@ func createGroup() *cache.Group {
 			if v, ok := db[key]; ok {
 				return []byte(v), nil
 			}
-			return nil, fmt.Errorf("%s not exist", key)
+			return nil, cache.ErrKeyNotFound
 		}))
 }
 

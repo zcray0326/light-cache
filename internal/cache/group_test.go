@@ -41,7 +41,7 @@ func TestGet(t *testing.T) {
 				loadCounts[key] += 1
 				return []byte(v), nil
 			}
-			return nil, fmt.Errorf("%s not exist", key)
+			return nil, ErrKeyNotFound
 		}))
 
 	for k, v := range db {
@@ -55,9 +55,13 @@ func TestGet(t *testing.T) {
 		}
 	}
 
-	// 回源不存在的 key:getter 返回 error,Group.Get 应透传该 error
+	// 回源不存在的 key:getter 返回 ErrKeyNotFound,Group.Get 应透传该 error
 	if view, err := gee.Get("unknown"); err == nil {
 		t.Fatalf("the value of unknow should be empty, but %s got", view)
+	}
+	// 第二次 Get 同一不存在的 key:应命中空值占位符(防穿透),不再回源,但仍返回 ErrKeyNotFound
+	if _, err := gee.Get("unknown"); err == nil {
+		t.Fatalf("second get of unknown should still be not-found (placeholder cached)")
 	}
 }
 
@@ -71,7 +75,7 @@ func TestGet_FIFO(t *testing.T) {
 				loadCounts[key]++
 				return []byte(v), nil
 			}
-			return nil, fmt.Errorf("%s not exist", key)
+			return nil, ErrKeyNotFound
 		}))
 
 	for k, v := range db {
@@ -102,7 +106,7 @@ func TestGet_WithTTL(t *testing.T) {
 				loadCounts[key]++
 				return []byte(v), nil
 			}
-			return nil, fmt.Errorf("%s not exist", key)
+			return nil, ErrKeyNotFound
 		}), WithTTL(ttl))
 	defer gee.Stop() // 停后台清理 goroutine,防泄漏
 
@@ -156,5 +160,128 @@ func TestGet_WithTTL_LazyExpire(t *testing.T) {
 	}
 	if loadCounts["Sam"] != 2 {
 		t.Fatalf("lazy expire should reload, got %d", loadCounts["Sam"])
+	}
+}
+
+// TestNullCache 验证缓存穿透防御(空值缓存):not-found key 首次回源后缓存占位符,
+// 后续同 key 命中占位符挡住 DB(不再回源),但仍返回 ErrKeyNotFound(保持 not-found 语义)。
+func TestNullCache(t *testing.T) {
+	loadCounts := make(map[string]int)
+	gee := NewGroup("scores-null", 2<<10, "lru", GetterFunc(
+		func(key string) ([]byte, error) {
+			loadCounts[key]++
+			if v, ok := db[key]; ok {
+				return []byte(v), nil
+			}
+			return nil, ErrKeyNotFound // 显式 sentinel:getLocally 据此缓存占位符
+		}))
+	defer gee.Stop()
+
+	// ① 首次 Get 不存在的 key:回源 1 次,返回 ErrKeyNotFound
+	if _, err := gee.Get("nope"); err == nil {
+		t.Fatalf("first get nope should return ErrKeyNotFound")
+	}
+	if loadCounts["nope"] != 1 {
+		t.Fatalf("first get should load once, got %d", loadCounts["nope"])
+	}
+
+	// ② 第二次 Get 同 key:命中占位符,不再回源(loadCounts 不增),仍返回 ErrKeyNotFound(防穿透关键)
+	if _, err := gee.Get("nope"); err == nil {
+		t.Fatalf("second get nope should still be not-found (placeholder)")
+	}
+	if loadCounts["nope"] != 1 {
+		t.Fatalf("second get should hit placeholder, no load, got %d", loadCounts["nope"])
+	}
+
+	// ③ 连续多次 Get,loadCounts 始终为 1(占位符持续挡住)
+	for i := 0; i < 5; i++ {
+		gee.Get("nope")
+	}
+	if loadCounts["nope"] != 1 {
+		t.Fatalf("placeholder should block all subsequent loads, got %d", loadCounts["nope"])
+	}
+}
+
+// TestNullCache_RealErrorNotCached 验证真错误(DB 故障等)不缓存占位符:
+// getter 返回非 ErrKeyNotFound 的 error 时,每次都回源(不被占位符挡)。
+func TestNullCache_RealErrorNotCached(t *testing.T) {
+	loadCounts := make(map[string]int)
+	gee := NewGroup("scores-err", 2<<10, "lru", GetterFunc(
+		func(key string) ([]byte, error) {
+			loadCounts[key]++
+			return nil, fmt.Errorf("db connection refused") // 非 sentinel 的真错误
+		}))
+	defer gee.Stop()
+
+	gee.Get("k1")
+	gee.Get("k1") // 真错误不缓存占位符,第二次仍回源
+	if loadCounts["k1"] != 2 {
+		t.Fatalf("real error should not be cached, should load twice, got %d", loadCounts["k1"])
+	}
+}
+
+// TestNullCache_TTLExpiresAndReloads 验证占位符也有 TTL:过期后重新回源(而非永久挡住)。
+func TestNullCache_TTLExpiresAndReloads(t *testing.T) {
+	loadCounts := make(map[string]int)
+	const ttl = 50 * time.Millisecond
+	gee := NewGroup("scores-null-ttl", 2<<10, "lru", GetterFunc(
+		func(key string) ([]byte, error) {
+			loadCounts[key]++
+			return nil, ErrKeyNotFound
+		}), WithTTL(ttl))
+	defer gee.Stop()
+
+	gee.Get("ghost") // 首次回源,缓存占位符
+	if loadCounts["ghost"] != 1 {
+		t.Fatalf("first get should load once, got %d", loadCounts["ghost"])
+	}
+
+	gee.Get("ghost") // 命中占位符,不回源
+	if loadCounts["ghost"] != 1 {
+		t.Fatalf("placeholder hit should not load, got %d", loadCounts["ghost"])
+	}
+
+	time.Sleep(ttl + 30*time.Millisecond) // 占位符过期
+
+	gee.Get("ghost") // 过期,重新回源(重新塞占位符)
+	if loadCounts["ghost"] != 2 {
+		t.Fatalf("after TTL, should reload (placeholder expired), got %d", loadCounts["ghost"])
+	}
+}
+
+// TestNullCache_LegitEmptyValueNotMisjudged 验证合法空值不被误判为占位符:
+// getter 返回 []byte("")(空字符串)的 key,命中后正常返回空字符串,不当 not-found。
+// 这是占位符方案的核心保证:靠值内容区分,合法空值内容是 "",不等于 "_LIGHTCACHE_NULL_"。
+func TestNullCache_LegitEmptyValueNotMisjudged(t *testing.T) {
+	loadCounts := make(map[string]int)
+	gee := NewGroup("scores-empty", 2<<10, "lru", GetterFunc(
+		func(key string) ([]byte, error) {
+			loadCounts[key]++
+			return []byte(""), nil // 合法空值:nil error,空 slice
+		}))
+	defer gee.Stop()
+
+	// 首次 Get:回源,返回空字符串 + nil error(不是 ErrKeyNotFound)
+	view, err := gee.Get("emptykey")
+	if err != nil {
+		t.Fatalf("legit empty value should not be ErrKeyNotFound, got %v", err)
+	}
+	if view.String() != "" {
+		t.Fatalf("legit empty value should be empty string, got %q", view.String())
+	}
+	if loadCounts["emptykey"] != 1 {
+		t.Fatalf("first get should load once, got %d", loadCounts["emptykey"])
+	}
+
+	// 第二次 Get:命中真实空值(非占位符),不回源,仍返回空字符串 + nil error
+	view2, err := gee.Get("emptykey")
+	if err != nil {
+		t.Fatalf("second get legit empty should still be nil error, got %v", err)
+	}
+	if view2.String() != "" {
+		t.Fatalf("second get should return cached empty string, got %q", view2.String())
+	}
+	if loadCounts["emptykey"] != 1 {
+		t.Fatalf("second get should hit cache, no load, got %d", loadCounts["emptykey"])
 	}
 }

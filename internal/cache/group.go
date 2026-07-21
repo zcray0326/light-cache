@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -8,6 +9,17 @@ import (
 
 	"github.com/zcray0326/light-cache/internal/cache/singleflight"
 )
+
+// ErrKeyNotFound 是 sentinel error:回源 getter 确认"key 不存在"时返回它。
+// getLocally 用 errors.Is 识别它来决定缓存空值占位符(防穿透);
+// 真错误(DB 故障等)绝不应返回它,避免把错误结果当 not-found 缓存。
+var ErrKeyNotFound = errors.New("key not found")
+
+// nullPlaceholder 是空值标记的固定占位符字符串(对齐 Redisson 的 _REDIS_NULL_PLACEHOLDER_ 思路)。
+// not-found 时往缓存塞 ByteView{b: []byte(nullPlaceholder)};
+// Group.Get 命中后靠内容判别 string(v.b) == nullPlaceholder 区分占位符与真实值。
+// 靠值内容判别,不靠内存对象状态:合法空值(空字符串)内容是 "",不等于占位符,不会误判。
+const nullPlaceholder = "_LIGHTCACHE_NULL_"
 
 // Getter 回源接口:缓存未命中时,Group 调用它从数据源(如 DB)取数据。
 type Getter interface {
@@ -86,6 +98,10 @@ func (g *Group) Get(key string) (ByteView, error) {
 
 	// 1. 先查本地缓存
 	if v, ok := g.mainCache.get(key); ok {
+		// 命中空值占位符:之前确认过该 key 不存在,挡了 DB,但仍对外返回 not-found(保持语义)
+		if string(v.b) == nullPlaceholder {
+			return ByteView{}, ErrKeyNotFound
+		}
 		log.Println("[light-cache] hit")
 		return v, nil
 	}
@@ -142,9 +158,16 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 }
 
 // getLocally 从回源 getter 取数据,包成 ByteView 写回缓存。
+// 若 getter 确认 key 不存在(返回 ErrKeyNotFound):缓存一个空值占位符短时挡住后续相同 key 的请求,
+// 防缓存穿透;但仍返回 ErrKeyNotFound(对外保持 not-found 语义)。
+// 真错误(DB 故障等)不缓存占位符,直接透传 error。
 func (g *Group) getLocally(key string) (ByteView, error) {
 	bytes, err := g.getter.Get(key)
 	if err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
+			// not-found:缓存占位符,短时挡住后续相同 key 的请求,防穿透
+			g.populateCache(key, ByteView{b: []byte(nullPlaceholder)})
+		}
 		return ByteView{}, err
 	}
 	// 回源拿到的 []byte 必须拷贝:调用方可能继续持有/修改这个 slice,不拷贝会污染缓存。
