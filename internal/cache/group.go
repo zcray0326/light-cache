@@ -87,14 +87,29 @@ type noopGetter struct{}
 func (noopGetter) Get(key string) ([]byte, error) { return nil, ErrKeyNotFound }
 
 // NewGroup 创建一个 Group 并注册到全局表(可按 name 查找)。
+// 幂等:同名 Group 已存在则直接返回旧的,不覆盖(不丢缓存、不泄漏后台 goroutine)。
+// 用双重检查锁:先 RLock 查,命中返回;再 Lock,double-check 后建。
 // evictionType 决定底层淘汰策略("lru"/"fifo"/"lfu"),maxBytes 为内存上限(0=不限),
-// getter 为未命中回源。opts 为可选配置(如 WithTTL),不传则默认无 TTL。
+// getter 为未命中回源。opts 为可选配置(如 WithTTL/WithProxyMode),不传则默认 Store 模式无 TTL。
 func NewGroup(name string, maxBytes int64, evictionType string, getter Getter, opts ...GroupOption) *Group {
 	if getter == nil {
 		panic("nil Getter")
 	}
+	// 第一次检查(读锁):已存在直接返回
+	mu.RLock()
+	if g, ok := groups[name]; ok {
+		mu.RUnlock()
+		return g
+	}
+	mu.RUnlock()
+
+	// 拿写锁
 	mu.Lock()
 	defer mu.Unlock()
+	// double-check:防并发重复建(两个 goroutine 同时过了第一次检查)
+	if g, ok := groups[name]; ok {
+		return g
+	}
 	g := &Group{
 		name:   name,
 		getter: getter,

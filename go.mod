@@ -2,7 +2,10 @@ module github.com/zcray0326/light-cache
 
 go 1.25.11
 
-require go.etcd.io/etcd/client/v3 v3.6.13
+require (
+	go.etcd.io/etcd/client/v3 v3.6.13
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/coreos/go-semver v0.3.1 // indirect

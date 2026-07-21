@@ -64,7 +64,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["-mode=store", "-port=8001", "-host=node1", "-etcd=http://etcd0:2379,http://etcd1:2379,http://etcd2:2379"]
+    command: ["-mode=store", "-port=8001", "-host=node1"]
+    volumes:
+      - ./config.yml:/app/config.yml:ro
     ports:
       - "8001:8001"
     depends_on:
@@ -79,7 +81,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["-mode=store", "-port=8002", "-host=node2", "-etcd=http://etcd0:2379,http://etcd1:2379,http://etcd2:2379"]
+    command: ["-mode=store", "-port=8002", "-host=node2"]
+    volumes:
+      - ./config.yml:/app/config.yml:ro
     ports:
       - "8002:8002"
     depends_on:
@@ -94,7 +98,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["-mode=store", "-port=8003", "-host=node3", "-etcd=http://etcd0:2379,http://etcd1:2379,http://etcd2:2379"]
+    command: ["-mode=store", "-port=8003", "-host=node3"]
+    volumes:
+      - ./config.yml:/app/config.yml:ro
     ports:
       - "8003:8003"
     depends_on:
@@ -110,7 +116,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["-mode=proxy", "-port=9999", "-host=api", "-etcd=http://etcd0:2379,http://etcd1:2379,http://etcd2:2379"]
+    command: ["-mode=proxy", "-port=9999", "-host=api"]
+    volumes:
+      - ./config.yml:/app/config.yml:ro
     ports:
       - "9999:9999"
     depends_on:

@@ -350,3 +350,31 @@ func TestStoreMode_NoNullCache(t *testing.T) {
 		t.Fatalf("Store should not cache null placeholder, should load twice, got %d", loadCounts["absent"])
 	}
 }
+
+// TestNewGroup_Idempotent 验证 NewGroup 幂等:同名重复建返回同一实例,不覆盖(不丢缓存、不泄漏 goroutine)。
+// 这是对齐 ggcache 的双重检查锁模式,修正 light-cache 之前"groups[name]=g 静默覆盖"的缺陷。
+func TestNewGroup_Idempotent(t *testing.T) {
+	name := "scores-idempotent"
+	getter := GetterFunc(func(string) ([]byte, error) { return []byte("v"), nil })
+	g1 := NewGroup(name, 2<<10, "lru", getter)
+	defer g1.Stop()
+	g2 := NewGroup(name, 2<<10, "lru", getter)
+
+	// 同名重复建:返回的是同一实例(指针相等),不是新覆盖
+	if g1 != g2 {
+		t.Fatalf("NewGroup should be idempotent: same name returns same instance, got different pointers")
+	}
+
+	// g1 回源写回的缓存,g2(重复建得到的同一实例)Get 应命中,证明缓存没丢
+	view, err := g2.Get("k1") // 回源 getter 返回 "v",写回缓存
+	if err != nil || view.String() != "v" {
+		t.Fatalf("idempotent NewGroup: g2.Get should hit g1's populated cache, got %v %v", view, err)
+	}
+}
+
+// TestGetGroup_NotFound 验证 GetGroup 不存在的 group 返回 nil(不 panic),由调用方判 nil。
+func TestGetGroup_NotFound(t *testing.T) {
+	if g := GetGroup("no-such-group"); g != nil {
+		t.Fatalf("GetGroup for non-existent group should return nil, got %v", g)
+	}
+}

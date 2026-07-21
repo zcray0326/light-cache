@@ -13,9 +13,10 @@ RUN CGO_ENABLED=0 go build -o /light-cache ./cmd/server
 # 运行镜像:alpine + 二进制
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates
-COPY --from=builder /light-cache /light-cache
+WORKDIR /app
+COPY --from=builder /light-cache /app/light-cache
 
 EXPOSE 8001 9999
-ENTRYPOINT ["/light-cache"]
+ENTRYPOINT ["/app/light-cache"]
 CMD ["-port=8001"]
 

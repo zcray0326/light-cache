@@ -1,0 +1,19 @@
+# light-cache 配置文件
+# 启动时 -config 指定路径(默认 config.yml)
+# Group 名单在此配置,Proxy 和 Store 各自按角色建(幂等,已存在返回旧的)
+
+groups:
+  - name: scores
+    evictionType: lru
+    maxBytes: 2048
+    ttl: 0            # 不启用 TTL
+  - name: users
+    evictionType: lfu
+    maxBytes: 4096
+    ttl: 0
+
+etcd:
+  endpoints:
+    - http://etcd0:2379
+    - http://etcd1:2379
+    - http://etcd2:2379
